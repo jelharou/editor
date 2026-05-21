@@ -201,6 +201,7 @@ export const WallTool: React.FC = () => {
     }
 
     const onGridClick = (event: GridEvent) => {
+      if (!wallPreviewRef.current) return
       const walls = getCurrentLevelWalls()
       const localClick: WallPlanPoint = [event.localPosition[0], event.localPosition[2]]
 
