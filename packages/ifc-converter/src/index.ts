@@ -352,6 +352,10 @@ type ExtrusionData = {
   xDim: number | null
   yDim: number | null
   profilePoints: number[][] | null
+  // Detected swept-area profile shape (model units, pre-unitFactor).
+  // 'round' carries `radius`; 'rectangular' carries xDim/yDim.
+  profileShape: 'round' | 'rectangular' | null
+  radius: number | null
 }
 
 function extractFromExtrusionItem(
@@ -378,9 +382,18 @@ function extractFromExtrusionItem(
   if (current.SweptArea?.value) {
     const profile = ifcApi.GetLine(modelID, current.SweptArea.value)
 
+    // Detect the profile shape by the fields present rather than the IFC
+    // type id — robust across web-ifc versions. IfcCircleProfileDef has a
+    // Radius; IfcRectangleProfileDef has XDim/YDim.
+    if (profile.Radius?.value != null) {
+      result.profileShape = 'round'
+      result.radius = profile.Radius.value
+    }
+
     if (profile.XDim?.value) {
       result.xDim = profile.XDim.value
       result.yDim = profile.YDim?.value ?? null
+      if (result.profileShape === null) result.profileShape = 'rectangular'
     }
 
     // Extract profile points — OuterCurve for ArbitraryClosedProfileDef
@@ -429,6 +442,8 @@ function getBodyExtrusionData(ifcApi: WebIFC.IfcAPI, modelID: number, element: a
     xDim: null,
     yDim: null,
     profilePoints: null,
+    profileShape: null,
+    radius: null,
   }
   try {
     if (!element.Representation?.value) return result
@@ -474,6 +489,90 @@ function findExtrusionPosition(ifcApi: WebIFC.IfcAPI, modelID: number, item: any
       current = ifcApi.GetLine(modelID, current.FirstOperand.value)
     } else {
       break
+    }
+  }
+  return null
+}
+
+// World-space axis-aligned bounding-box extents of an element's mesh,
+// via web-ifc's geometry API. Used to recover wall height/thickness for
+// plain IFCWALL whose Brep/mapped geometry getBodyExtrusionData can't
+// read. Returns [extX, extY, extZ] in the geometry's native units (the
+// caller resolves units), or null on any failure.
+function measureElementAabbExtents(
+  ifcApi: WebIFC.IfcAPI,
+  modelID: number,
+  expressID: number,
+): [number, number, number] | null {
+  try {
+    const mesh = ifcApi.GetFlatMesh(modelID, expressID)
+    const geoms = mesh.geometries
+    const min = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]
+    const max = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY]
+    let any = false
+    for (let g = 0; g < geoms.size(); g++) {
+      const pg = geoms.get(g)
+      const m = pg.flatTransformation
+      const geo = ifcApi.GetGeometry(modelID, pg.geometryExpressID)
+      const verts = ifcApi.GetVertexArray(geo.GetVertexData(), geo.GetVertexDataSize())
+      // 6 floats per vertex: position xyz + normal xyz.
+      for (let v = 0; v + 2 < verts.length; v += 6) {
+        const x = verts[v]
+        const y = verts[v + 1]
+        const z = verts[v + 2]
+        // flatTransformation is a column-major 4x4.
+        const wx = m[0] * x + m[4] * y + m[8] * z + m[12]
+        const wy = m[1] * x + m[5] * y + m[9] * z + m[13]
+        const wz = m[2] * x + m[6] * y + m[10] * z + m[14]
+        if (wx < min[0]) min[0] = wx
+        if (wx > max[0]) max[0] = wx
+        if (wy < min[1]) min[1] = wy
+        if (wy > max[1]) max[1] = wy
+        if (wz < min[2]) min[2] = wz
+        if (wz > max[2]) max[2] = wz
+        any = true
+      }
+      ;(geo as unknown as { delete?: () => void }).delete?.()
+    }
+    ;(mesh as unknown as { delete?: () => void }).delete?.()
+    if (!any) return null
+    return [max[0] - min[0], max[1] - min[1], max[2] - min[2]]
+  } catch {
+    return null
+  }
+}
+
+// Derive wall height + thickness from the geometry AABB extents. Robust
+// to both the up-axis convention and the unit convention: we identify
+// the LENGTH axis as whichever extent matches the wall's already-known
+// length (trying both raw and unit-scaled interpretations), then take
+// the smaller of the remaining two as thickness and the larger as
+// height. Returns null when no interpretation yields plausible wall
+// dimensions, so the caller can fall back to defaults.
+function wallHeightThicknessFromExtents(
+  extentsRaw: [number, number, number],
+  knownLengthMeters: number,
+  unitFactor: number,
+): { height: number; thickness: number } | null {
+  if (knownLengthMeters <= 1e-6) return null
+  const tol = Math.max(0.5, 0.25 * knownLengthMeters)
+  for (const scale of [unitFactor, 1]) {
+    const ext = extentsRaw.map((e) => e * scale)
+    let bestIdx = -1
+    let bestDiff = Number.POSITIVE_INFINITY
+    for (let i = 0; i < 3; i++) {
+      const d = Math.abs((ext[i] ?? 0) - knownLengthMeters)
+      if (d < bestDiff) {
+        bestDiff = d
+        bestIdx = i
+      }
+    }
+    if (bestDiff > tol) continue
+    const rest = ext.filter((_, i) => i !== bestIdx)
+    const thickness = Math.min(rest[0] ?? 0, rest[1] ?? 0)
+    const height = Math.max(rest[0] ?? 0, rest[1] ?? 0)
+    if (height >= 0.2 && height <= 20 && thickness >= 0.02 && thickness <= 2) {
+      return { height, thickness }
     }
   }
   return null
@@ -917,12 +1016,20 @@ export async function convertIfcToPascal(
       // Plain IFCWALL frequently carries Brep / mapped geometry rather
       // than a clean IfcExtrudedAreaSolid, so getBodyExtrusionData can't
       // read its height/thickness (only IFCWALLSTANDARDCASE reliably
-      // works). Fall back to the editor's wall defaults so the wall
-      // renders at a sensible size instead of collapsing to a
-      // zero-height sliver — which also breaks the door/window CSG
-      // cutouts punched into it.
-      // TODO(ifc-fix): derive exact dims from the element geometry AABB
-      // (web-ifc GetFlatMesh) for non-extruded walls.
+      // works). First try to recover real dims from the element's mesh
+      // bounding box; only then fall back to the editor's wall defaults
+      // so the wall renders at a sensible size instead of collapsing to
+      // a zero-height sliver (which also breaks the door/window CSG
+      // cutouts punched into it).
+      if (height === undefined || thickness === undefined) {
+        const extents = measureElementAabbExtents(ifcApi, modelID, wallExpressID)
+        const wallLenM = Math.hypot(end[0] - start[0], end[1] - start[1])
+        const geom = extents ? wallHeightThicknessFromExtents(extents, wallLenM, unitFactor) : null
+        if (geom) {
+          if (height === undefined) height = geom.height
+          if (thickness === undefined) thickness = geom.thickness
+        }
+      }
       if (height === undefined) height = DEFAULT_WALL_HEIGHT
       if (thickness === undefined) thickness = DEFAULT_WALL_THICKNESS
 
@@ -1615,6 +1722,8 @@ export async function convertIfcToPascal(
       let width: number | undefined
       let depth: number | undefined
       let height: number | undefined
+      let profileShape: 'round' | 'rectangular' | null = null
+      let profileRadius: number | undefined
 
       try {
         const worldMat = col.ObjectPlacement?.value
@@ -1632,6 +1741,8 @@ export async function convertIfcToPascal(
           if (body.xDim) width = body.xDim * unitFactor
           if (body.yDim) depth = body.yDim * unitFactor
         }
+        profileShape = body.profileShape
+        if (body.radius != null) profileRadius = body.radius * unitFactor
       } catch {
         /* keep defaults */
       }
@@ -1641,12 +1752,16 @@ export async function convertIfcToPascal(
       // shaft → a classical/Greek look), and the default round
       // cross-section ignores width/depth in favour of `radius`. Strip
       // the ornament, keep the shaft full-width, and size from the IFC
-      // profile: rectangular when width≠depth, otherwise a round shaft
-      // whose radius comes from the profile.
+      // profile: use the real swept-area profile type when known
+      // (IfcCircleProfileDef → round + radius, IfcRectangleProfileDef →
+      // rectangular + width/depth), falling back to the width/depth
+      // ratio when the profile type isn't recognised.
       const isRect =
-        width !== undefined &&
-        depth !== undefined &&
-        Math.abs(width - depth) > 0.15 * Math.max(width, depth)
+        profileShape === 'rectangular' ||
+        (profileShape === null &&
+          width !== undefined &&
+          depth !== undefined &&
+          Math.abs(width - depth) > 0.15 * Math.max(width, depth))
       const columnNode = tryParse(ColumnNode, 'column', {
         object: 'node',
         id: nodeId,
@@ -1659,7 +1774,7 @@ export async function convertIfcToPascal(
         depth,
         height,
         crossSection: isRect ? 'rectangular' : 'round',
-        radius: Math.max(width ?? 0.44, depth ?? 0.44) / 2,
+        radius: profileRadius ?? Math.max(width ?? 0.44, depth ?? 0.44) / 2,
         style: 'plain',
         shaftProfile: 'straight',
         shaftStartScale: 1,
